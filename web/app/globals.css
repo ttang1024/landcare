@@ -1,0 +1,22 @@
+@import "tailwindcss";
+
+/* Landcare brand tokens (Tailwind 4 @theme). */
+@theme {
+  --color-landcare-green: #2e7d32;
+  --color-landcare-water: #0277bd;
+  --color-landcare-earth: #6d4c41;
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-white text-neutral-900 antialiased;
+}
+
+/* Visible focus ring for keyboard navigation (WCAG AA). */
+:focus-visible {
+  outline: 2px solid var(--color-landcare-water);
+  outline-offset: 2px;
+}

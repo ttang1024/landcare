@@ -1,0 +1,31 @@
+# Secrets
+.env
+.env.local
+*.pem
+
+# PHP
+/api/vendor/
+/api/.phpunit.cache/
+/api/composer.lock
+
+# Node / Next
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/coverage/
+/web/playwright-report/
+/web/test-results/
+*.tsbuildinfo
+
+# Vercel
+.vercel/
+
+# Evals
+/evals/node_modules/
+/evals/results/
+
+# OS / editor
+.DS_Store
+*.log
+.idea/
+.vscode/
