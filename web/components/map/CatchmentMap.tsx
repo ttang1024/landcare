@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
 import type { CatchmentMapProps } from "./CatchmentMapLazy";
 import { TYPE_COLORS, TYPE_LABELS } from "@/lib/group-types";
@@ -28,6 +29,35 @@ const SELECTED_MIN_ZOOM = 9;
 // interactive search (no API key needed); we restrict it to NZ addresses.
 const GEOCODER_URL =
   "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer";
+
+// Esri's public Export Web Map task, used by the Print widget to render the
+// current map to PDF/image. Anonymous, no API key required.
+const PRINT_SERVICE_URL =
+  "https://utility.arcgisonline.com/arcgis/rest/services/Utilities/PrintingTools/GPServer/Export%20Web%20Map%20Task";
+
+// localStorage keys for session-persisted map annotations and bookmarks.
+const SKETCH_KEY = "catchmentmap:annotations";
+const BOOKMARKS_KEY = "catchmentmap:bookmarks";
+
+/** Read a JSON array from localStorage, tolerating missing/corrupt values. */
+function loadStored(key: string): Record<string, unknown>[] {
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Persist a JSON-serialisable value, swallowing quota/serialisation errors. */
+function saveStored(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* ignore — storage full or unavailable */
+  }
+}
 
 type AmdRequire = (modules: string[], onLoad: (...mods: unknown[]) => void) => void;
 
@@ -96,6 +126,26 @@ type EsriMeasurement = {
   destroy: () => void;
 };
 
+// JSON-serialisable map artefacts (Graphic / Bookmark both expose `toJSON`).
+type EsriJSONObject = { toJSON: () => Record<string, unknown> };
+type EsriCollection<T> = {
+  toArray: () => T[];
+  on: (event: string, handler: () => void) => void;
+};
+// `Graphic` constructor, plus the static `fromJSON` used to rehydrate drawings.
+type EsriGraphicCtor = Ctor<EsriFeature> & {
+  fromJSON: (json: Record<string, unknown>) => EsriFeature;
+};
+type EsriGraphicsLayer = {
+  graphics: EsriCollection<EsriJSONObject>;
+  addMany: (graphics: unknown[]) => void;
+};
+// Sketch fires create/update/delete; `state === "complete"` marks a finished edit.
+type EsriSketch = {
+  on: (event: string, handler: (e: { state?: string }) => void) => void;
+};
+type EsriBookmarks = { bookmarks: EsriCollection<EsriJSONObject> };
+
 function markerSymbol(color: string) {
   return {
     type: "simple-marker",
@@ -151,6 +201,12 @@ export function CatchmentMap({
   const [ready, setReady] = useState(false);
   const [error, setError] = useState(false);
   const [activeTool, setActiveTool] = useState<MeasureTool | null>(null);
+  // Whether the measurement options popup (under the ruler button) is open.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const measureRef = useRef<HTMLDivElement | null>(null);
+  // Host node for the custom measure control, slotted into the ESRI widget stack.
+  // Held in state (not a ref) so the portal renders once the node exists.
+  const [measureSlot, setMeasureSlot] = useState<HTMLDivElement | null>(null);
   // Map longitude/latitude under the cursor, shown in the coordinate readout.
   const [pointer, setPointer] = useState<{ lng: number; lat: number } | null>(null);
 
@@ -179,6 +235,10 @@ export function CatchmentMap({
         Legend,
         Expand,
         ScaleBar,
+        GraphicsLayer,
+        Sketch,
+        Bookmarks,
+        Print,
       ] = (await requireModules(req, [
         "esri/Map",
         "esri/views/MapView",
@@ -193,11 +253,15 @@ export function CatchmentMap({
         "esri/widgets/Legend",
         "esri/widgets/Expand",
         "esri/widgets/ScaleBar",
+        "esri/layers/GraphicsLayer",
+        "esri/widgets/Sketch",
+        "esri/widgets/Bookmarks",
+        "esri/widgets/Print",
       ])) as [
         Ctor<unknown>,
         Ctor<EsriView>,
         Ctor<EsriLayer>,
-        Ctor<unknown>,
+        EsriGraphicCtor,
         Ctor<unknown>,
         Ctor<EsriMeasurement>,
         Ctor<unknown>,
@@ -206,6 +270,10 @@ export function CatchmentMap({
         Ctor<unknown>,
         Ctor<unknown>,
         Ctor<unknown>,
+        Ctor<unknown>,
+        Ctor<EsriGraphicsLayer>,
+        Ctor<EsriSketch>,
+        Ctor<EsriBookmarks>,
         Ctor<unknown>,
       ];
       if (cancelled || !ref.current) return;
@@ -277,7 +345,15 @@ export function CatchmentMap({
       });
       layerRef.current = layer;
 
-      const map = new EsriMap({ basemap: "topo-vector", layers: [layer] });
+      // Empty layer the Sketch tool draws annotations onto, kept above the
+      // group points so markups stay visible. Any drawings saved in a previous
+      // session are rehydrated from localStorage.
+      const sketchLayer = new GraphicsLayer({ title: "Annotations" });
+      const storedGraphics = loadStored(SKETCH_KEY);
+      if (storedGraphics.length) {
+        sketchLayer.addMany(storedGraphics.map((g) => Graphic.fromJSON(g)));
+      }
+      const map = new EsriMap({ basemap: "topo-vector", layers: [layer, sketchLayer] });
       const view = new MapView({
         container: ref.current,
         map,
@@ -351,12 +427,85 @@ export function CatchmentMap({
         content: legend,
         expanded: false,
         expandTooltip: "Legend",
+        // Shared `group` makes the top-left expandables mutually exclusive:
+        // opening one collapses whichever was previously open.
+        group: "top-left",
       });
       view.ui.add(legendExpand, "top-left");
 
       // Scale bar (metric + imperial) for distance context at the current zoom.
       const scaleBar = new ScaleBar({ view, unit: "dual" });
       view.ui.add(scaleBar, "bottom-left");
+
+      // Sketch: draw points, lines, polygons and rectangles onto the annotation
+      // layer to mark up the map (e.g. an area of interest). Includes select,
+      // reshape and delete; tucked inside an Expand to keep the toolbar compact.
+      const sketch = new Sketch({
+        view,
+        layer: sketchLayer,
+        creationMode: "update",
+        visibleElements: { settingsMenu: false },
+      });
+      const sketchExpand = new Expand({
+        view,
+        content: sketch,
+        expanded: false,
+        expandTooltip: "Draw on the map",
+        group: "top-left",
+      });
+      view.ui.add(sketchExpand, "top-left");
+
+      // Persist drawings to localStorage whenever an edit completes (a shape is
+      // finished, moved/reshaped, or deleted) so they survive a page reload.
+      const persistSketch = () =>
+        saveStored(SKETCH_KEY, sketchLayer.graphics.toArray().map((g) => g.toJSON()));
+      sketch.on("create", (e) => {
+        if (e.state === "complete") persistSketch();
+      });
+      sketch.on("update", (e) => {
+        if (e.state === "complete") persistSketch();
+      });
+      sketch.on("delete", persistSketch);
+
+      // Bookmarks: save the current viewpoint and jump back to it later. Editing
+      // is enabled so users can capture their own spots; saved entries are loaded
+      // from localStorage and re-persisted whenever the collection changes.
+      const bookmarks = new Bookmarks({
+        view,
+        editingEnabled: true,
+        visibleElements: { addBookmarkButton: true, editBookmarkButton: true },
+        bookmarks: loadStored(BOOKMARKS_KEY),
+      });
+      bookmarks.bookmarks.on("change", () =>
+        saveStored(BOOKMARKS_KEY, bookmarks.bookmarks.toArray().map((b) => b.toJSON())),
+      );
+      const bookmarksExpand = new Expand({
+        view,
+        content: bookmarks,
+        expanded: false,
+        expandTooltip: "Bookmarks",
+        group: "top-left",
+      });
+      view.ui.add(bookmarksExpand, "top-left");
+
+      // Print / export: render the current map (extent, layers, annotations) to a
+      // downloadable PDF or image via Esri's anonymous Export Web Map service.
+      const print = new Print({ view, printServiceUrl: PRINT_SERVICE_URL });
+      const printExpand = new Expand({
+        view,
+        content: print,
+        expanded: false,
+        expandTooltip: "Print / export map",
+        group: "top-left",
+      });
+      view.ui.add(printExpand, "top-left");
+
+      // Slot the custom measurement control into the same top-left widget stack
+      // so the ruler sits with the other tool icons. The button + popup are
+      // rendered into this node via a React portal (see render below).
+      const slot = document.createElement("div");
+      setMeasureSlot(slot);
+      view.ui.add(slot, "top-left");
 
       // Live coordinate readout: track the pointer and surface the map
       // longitude/latitude under the cursor in the custom overlay below.
@@ -386,8 +535,10 @@ export function CatchmentMap({
       viewRef.current = null;
       layerRef.current = null;
       measurementRef.current = null;
+      setMeasureSlot(null);
       setReady(false);
       setActiveTool(null);
+      setMenuOpen(false);
       setPointer(null);
     };
   }, [groups]);
@@ -472,6 +623,25 @@ export function CatchmentMap({
     };
   }, [ready, selectedId, groups]);
 
+  // Close the options popup on outside click or Escape.
+  useEffect(() => {
+    if (!menuOpen) return;
+    function onPointerDown(e: MouseEvent) {
+      if (measureRef.current && !measureRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") setMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuOpen]);
+
   // Activate a measurement tool, or toggle it off (clearing any drawing) when
   // the same tool is tapped again.
   function toggleTool(tool: MeasureTool) {
@@ -513,31 +683,56 @@ export function CatchmentMap({
         className="h-full w-full"
       />
 
-      {ready && (
-        <div
-          role="group"
-          aria-label="Map measurement tools"
-          className="absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-1 rounded-md border border-neutral-200 bg-white/95 p-1 text-sm shadow-sm backdrop-blur"
-        >
-          <ToolButton
-            active={activeTool === "distance"}
-            onClick={() => toggleTool("distance")}
-          >
-            Measure distance
-          </ToolButton>
-          <ToolButton active={activeTool === "area"} onClick={() => toggleTool("area")}>
-            Measure area
-          </ToolButton>
-          <button
-            type="button"
-            onClick={clearMeasurements}
-            disabled={!activeTool}
-            className="rounded px-2.5 py-1.5 font-medium text-neutral-600 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            Clear
-          </button>
-        </div>
-      )}
+      {measureSlot &&
+        createPortal(
+          <div ref={measureRef} className="relative">
+            <button
+              type="button"
+              aria-label="Measurement tools"
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              aria-pressed={activeTool !== null}
+              onClick={() => setMenuOpen((open) => !open)}
+              // Match the 32px square ESRI widget buttons it sits beside.
+              className={`flex h-8 w-8 items-center justify-center shadow-[0_1px_2px_rgba(0,0,0,0.3)] transition-colors ${
+                activeTool !== null
+                  ? "bg-neutral-900 text-white"
+                  : "bg-white text-[#6e6e6e] hover:bg-neutral-100"
+              }`}
+            >
+              <RulerIcon />
+            </button>
+
+            {menuOpen && (
+              <div
+                role="menu"
+                aria-label="Map measurement tools"
+                // Open to the right so it doesn't cover the icons stacked below.
+                className="absolute left-full top-0 ml-1.5 flex flex-col gap-0.5 rounded-md border border-neutral-200 bg-white/95 p-1 text-sm shadow-md backdrop-blur"
+              >
+                <MenuItem
+                  active={activeTool === "distance"}
+                  onClick={() => toggleTool("distance")}
+                >
+                  Measure distance
+                </MenuItem>
+                <MenuItem active={activeTool === "area"} onClick={() => toggleTool("area")}>
+                  Measure area
+                </MenuItem>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={clearMeasurements}
+                  disabled={!activeTool}
+                  className="rounded px-2.5 py-1.5 text-left font-medium text-neutral-600 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+          </div>,
+          measureSlot,
+        )}
 
       {ready && pointer && (
         <div
@@ -551,7 +746,7 @@ export function CatchmentMap({
   );
 }
 
-function ToolButton({
+function MenuItem({
   active,
   onClick,
   children,
@@ -563,13 +758,34 @@ function ToolButton({
   return (
     <button
       type="button"
-      aria-pressed={active}
+      role="menuitemradio"
+      aria-checked={active}
       onClick={onClick}
-      className={`rounded px-2.5 py-1.5 font-medium transition-colors ${
+      className={`whitespace-nowrap rounded px-2.5 py-1.5 text-left font-medium transition-colors ${
         active ? "bg-neutral-900 text-white" : "text-neutral-700 hover:bg-neutral-100"
       }`}
     >
       {children}
     </button>
+  );
+}
+
+// Simple ruler glyph for the measurement tools trigger.
+function RulerIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M3.6 8.5 8.5 3.6a1.5 1.5 0 0 1 2.1 0l9.8 9.8a1.5 1.5 0 0 1 0 2.1l-4.9 4.9a1.5 1.5 0 0 1-2.1 0L3.6 10.6a1.5 1.5 0 0 1 0-2.1Z" />
+      <path d="m8 6 2 2M11 9l1.5 1.5M14 6l2 2M9 11l1.5 1.5" />
+    </svg>
   );
 }

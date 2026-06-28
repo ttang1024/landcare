@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Image from "next/image";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -15,6 +16,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           Skip to map
         </a>
         <header className="flex shrink-0 items-center gap-3 border-b border-neutral-200 px-4 py-3">
+          <Image
+            src="/images/logo.png"
+            alt="LandcareLink"
+            width={1100}
+            height={968}
+            priority
+            className="h-8 w-auto"
+          />
           <span className="font-semibold text-(--color-landcare-green)">LandcareLink</span>
           <span className="hidden text-sm text-neutral-500 sm:inline">Catchments Map</span>
         </header>

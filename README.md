@@ -64,6 +64,21 @@ cd web && vercel --prod   # production
 
 > Requires Next.js ≥ 16.2.9 — Vercel blocks deploys of versions with open advisories.
 
+## Map tools
+
+The catchment map (ArcGIS Maps SDK) ships with:
+
+- **Search** — find a New Zealand address (geocoder constrained to NZL).
+- **Measure** — distance and area tools, with clear.
+- **Draw** — sketch points/lines/polygons; annotations persist across reloads.
+- **Bookmarks** — save and revisit viewpoints (persisted).
+- **Print** — export the current map to PDF/image.
+- **Basemap toggle** — switch between topographic and satellite imagery.
+- **Home / Locate / Fullscreen** — reset extent, geolocate, expand to screen.
+- **Legend / Scale bar / coordinate readout** — context for what's on screen.
+
+Top-left expandable tools are grouped, so opening one collapses the previously open one.
+
 ## Notes
 
 - **Config** — see [`.env.example`](.env.example); secrets stay in env vars, never
