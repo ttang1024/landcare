@@ -20,9 +20,16 @@ import { TYPE_COLORS, TYPE_LABELS } from "@/lib/group-types";
 const ARCGIS_VERSION = "4.31";
 const ARCGIS_BASE = `https://js.arcgis.com/${ARCGIS_VERSION}`;
 
-// Full-country view (Aotearoa New Zealand).
-const NZ_CENTER: [number, number] = [173.2, -41.0];
-const NZ_ZOOM = 5;
+// Full-country view (Aotearoa New Zealand). A geographic extent of the main
+// islands (incl. Stewart Island) rather than a fixed centre/zoom, so the country
+// fills the frame at any aspect ratio instead of floating in a sea of ocean.
+const NZ_EXTENT = {
+  xmin: 166.0,
+  ymin: -47.4,
+  xmax: 178.8,
+  ymax: -34.0,
+  spatialReference: { wkid: 4326 },
+};
 const SELECTED_MIN_ZOOM = 9;
 
 // Esri's World Geocoder. The Search widget may call this anonymously for
@@ -104,7 +111,7 @@ type EsriFeature = { geometry: unknown; attributes: Record<string, string> };
 type EsriQuery = { where: string; returnGeometry: boolean; outFields: string[] };
 type EsriLayerView = { queryFeatures: (q: EsriQuery) => Promise<{ features: EsriFeature[] }> };
 type EsriLayer = { definitionExpression: string; createQuery: () => EsriQuery };
-type EsriMapPoint = { longitude: number; latitude: number };
+type EsriMapPoint = { longitude: number | null; latitude: number | null };
 type EsriView = {
   zoom: number;
   openPopup: (o: unknown) => Promise<unknown>;
@@ -228,7 +235,7 @@ export function CatchmentMap({
         Graphic,
         Search,
         Measurement,
-        BasemapToggle,
+        BasemapGallery,
         Home,
         Locate,
         Fullscreen,
@@ -238,6 +245,7 @@ export function CatchmentMap({
         GraphicsLayer,
         Sketch,
         Bookmarks,
+        Bookmark,
         Print,
       ] = (await requireModules(req, [
         "esri/Map",
@@ -246,7 +254,7 @@ export function CatchmentMap({
         "esri/Graphic",
         "esri/widgets/Search",
         "esri/widgets/Measurement",
-        "esri/widgets/BasemapToggle",
+        "esri/widgets/BasemapGallery",
         "esri/widgets/Home",
         "esri/widgets/Locate",
         "esri/widgets/Fullscreen",
@@ -256,6 +264,7 @@ export function CatchmentMap({
         "esri/layers/GraphicsLayer",
         "esri/widgets/Sketch",
         "esri/widgets/Bookmarks",
+        "esri/webmap/Bookmark",
         "esri/widgets/Print",
       ])) as [
         Ctor<unknown>,
@@ -274,6 +283,7 @@ export function CatchmentMap({
         Ctor<EsriGraphicsLayer>,
         Ctor<EsriSketch>,
         Ctor<EsriBookmarks>,
+        { fromJSON: (json: Record<string, unknown>) => unknown },
         Ctor<unknown>,
       ];
       if (cancelled || !ref.current) return;
@@ -353,12 +363,11 @@ export function CatchmentMap({
       if (storedGraphics.length) {
         sketchLayer.addMany(storedGraphics.map((g) => Graphic.fromJSON(g)));
       }
-      const map = new EsriMap({ basemap: "topo-vector", layers: [layer, sketchLayer] });
+      const map = new EsriMap({ basemap: "satellite", layers: [layer, sketchLayer] });
       const view = new MapView({
         container: ref.current,
         map,
-        center: NZ_CENTER,
-        zoom: NZ_ZOOM,
+        extent: NZ_EXTENT,
         popup: { dockEnabled: false, collapseEnabled: false },
         constraints: { minZoom: 4 },
       });
@@ -397,10 +406,18 @@ export function CatchmentMap({
       view.ui.add(measurement, "bottom-right");
       measurementRef.current = measurement;
 
-      // Map-mode switch: toggle between the topographic basemap and satellite
-      // aerial imagery. The widget shows a thumbnail of the inactive mode.
-      const basemapToggle = new BasemapToggle({ view, nextBasemap: "satellite" });
-      view.ui.add(basemapToggle, "bottom-left");
+      // Basemap picker: choose from Esri's gallery of basemaps (satellite,
+      // topographic, streets, terrain, etc.). The map opens on satellite
+      // imagery; the gallery lets users switch to any other view. Tucked inside
+      // an Expand so it stays a single icon until opened.
+      const basemapGallery = new BasemapGallery({ view });
+      const basemapExpand = new Expand({
+        view,
+        content: basemapGallery,
+        expanded: false,
+        expandTooltip: "Change basemap",
+      });
+      view.ui.add(basemapExpand, "bottom-left");
 
       // Home: one click returns the view to the national extent (the same
       // centre/zoom the map opens at), so users can recover after panning away.
@@ -472,9 +489,9 @@ export function CatchmentMap({
       // from localStorage and re-persisted whenever the collection changes.
       const bookmarks = new Bookmarks({
         view,
-        editingEnabled: true,
+        dragEnabled: true,
         visibleElements: { addBookmarkButton: true, editBookmarkButton: true },
-        bookmarks: loadStored(BOOKMARKS_KEY),
+        bookmarks: loadStored(BOOKMARKS_KEY).map((b) => Bookmark.fromJSON(b)),
       });
       bookmarks.bookmarks.on("change", () =>
         saveStored(BOOKMARKS_KEY, bookmarks.bookmarks.toArray().map((b) => b.toJSON())),
@@ -511,7 +528,12 @@ export function CatchmentMap({
       // longitude/latitude under the cursor in the custom overlay below.
       view.on("pointer-move", (event) => {
         const point = view.toMap(event);
-        if (point) setPointer({ lng: point.longitude, lat: point.latitude });
+        // `toMap` can return a point with null lng/lat when the cursor is over
+        // an area outside the projected map; skip those so the readout (which
+        // calls `toFixed`) never sees a null coordinate.
+        if (point && point.longitude != null && point.latitude != null) {
+          setPointer({ lng: point.longitude, lat: point.latitude });
+        }
       });
       view.on("pointer-leave", () => setPointer(null));
 
@@ -565,7 +587,7 @@ export function CatchmentMap({
 
     if (!regionFilter) {
       // Only reset the view when a region was previously active.
-      if (prev) view.goTo({ center: NZ_CENTER, zoom: NZ_ZOOM }).catch(() => undefined);
+      if (prev) view.goTo(NZ_EXTENT).catch(() => undefined);
       return;
     }
 

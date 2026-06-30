@@ -1,8 +1,8 @@
 # LandcareLink — Catchment Mapping Platform
 
-GIS platform for **NZ Landcare Trust** (Ngā Matapopore Whenua). Adds an integration
-layer on top of the existing LandcareLink ecosystem (PHP, MySQL, Scriptcase, ArcGIS
-Online) — it does **not** replace those systems.
+GIS platform for **NZ Landcare Trust** (Ngā Matapopore Whenua). An integration layer
+over the existing LandcareLink ecosystem (PHP, MySQL, Scriptcase, ArcGIS Online) — it
+does **not** replace those systems.
 
 **Live:** https://landcarelink-web.vercel.app/
 
@@ -17,7 +17,7 @@ PHP 8.3 REST API (Clean Architecture)
   └── MySQL 8  (system of record)
 ```
 
-The API surface is minimal: the frontend consumes `GET /v1/map/groups` (plus
+Minimal API surface: the frontend consumes `GET /v1/map/groups` (plus
 `GET /v1/health` for ops).
 
 ```
@@ -68,21 +68,21 @@ cd web && vercel --prod   # production
 
 The catchment map (ArcGIS Maps SDK) ships with:
 
-- **Search** — find a New Zealand address (geocoder constrained to NZL).
-- **Measure** — distance and area tools, with clear.
-- **Draw** — sketch points/lines/polygons; annotations persist across reloads.
+- **Search** — find an NZ address (geocoder constrained to NZL).
+- **Measure** — distance and area, with clear.
+- **Draw** — sketch points/lines/polygons; persists across reloads.
 - **Bookmarks** — save and revisit viewpoints (persisted).
-- **Print** — export the current map to PDF/image.
-- **Basemap toggle** — switch between topographic and satellite imagery.
+- **Print** — export the map to PDF/image.
+- **Basemap toggle** — topographic ⇄ satellite imagery.
 - **Home / Locate / Fullscreen** — reset extent, geolocate, expand to screen.
-- **Legend / Scale bar / coordinate readout** — context for what's on screen.
+- **Legend / Scale bar / coordinate readout**.
 
-Top-left expandable tools are grouped, so opening one collapses the previously open one.
+Top-left expandable tools are grouped — opening one collapses the previous.
 
 ## Notes
 
 - **Config** — see [`.env.example`](.env.example); secrets stay in env vars, never
-  exposed to the frontend. ArcGIS basemaps render client-side via the Maps SDK.
+  exposed to the frontend. ArcGIS basemaps render client-side.
 - **Security** — Zod validation, rate limiting, CSRF protection, output sanitisation,
   clean dependency audit.
 - **Observability** — structured logging, request IDs, metrics, audit logs, health
