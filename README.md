@@ -6,6 +6,9 @@ does **not** replace those systems.
 
 **Live:** https://landcarelink-web.vercel.app/
 
+> **Note:** Some data on the page is mocked — the demo focuses on showcasing the
+> map interaction features.
+
 ## Architecture
 
 ```
@@ -68,6 +71,9 @@ cd web && vercel --prod   # production
 
 The catchment map (ArcGIS Maps SDK) ships with:
 
+- **Display modes** — clusters (default) ⇄ individual points ⇄ heatmap.
+- **Hover tooltips** — group name (or cluster count) under the cursor.
+- **Share view** — copy a link (`#map=zoom/lat/lng`) that reopens the exact viewpoint.
 - **Search** — find an NZ address (geocoder constrained to NZL).
 - **Measure** — distance and area, with clear.
 - **Draw** — sketch points/lines/polygons; persists across reloads.
