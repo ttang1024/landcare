@@ -110,10 +110,16 @@ type Ctor<T> = new (o?: unknown) => T;
 type EsriFeature = { geometry: unknown; attributes: Record<string, string> };
 type EsriQuery = { where: string; returnGeometry: boolean; outFields: string[] };
 type EsriLayerView = { queryFeatures: (q: EsriQuery) => Promise<{ features: EsriFeature[] }> };
-type EsriLayer = { definitionExpression: string; createQuery: () => EsriQuery };
+type EsriLayer = {
+  definitionExpression: string;
+  createQuery: () => EsriQuery;
+  featureReduction: unknown;
+  renderer: unknown;
+};
 type EsriMapPoint = { longitude: number | null; latitude: number | null };
 type EsriView = {
   zoom: number;
+  center: EsriMapPoint | null;
   openPopup: (o: unknown) => Promise<unknown>;
   destroy: () => void;
   when: () => Promise<unknown>;
@@ -160,6 +166,72 @@ function markerSymbol(color: string) {
     size: 9,
     outline: { color: "#ffffff", width: 1 },
   };
+}
+
+// One coloured marker per group type — the layer's default renderer, restored
+// when leaving heatmap mode.
+const POINT_RENDERER = {
+  type: "unique-value",
+  field: "gtype",
+  uniqueValueInfos: [
+    { value: "catchment", symbol: markerSymbol(TYPE_COLORS.catchment) },
+    { value: "community", symbol: markerSymbol(TYPE_COLORS.community) },
+    { value: "environmental", symbol: markerSymbol(TYPE_COLORS.environmental) },
+  ],
+};
+
+// Cluster display (the default) — nearby points merge into a counted circle.
+const CLUSTER_REDUCTION = {
+  type: "cluster",
+  clusterRadius: "80px",
+  clusterMinSize: "22px",
+  clusterMaxSize: "44px",
+  labelingInfo: [
+    {
+      deconflictionStrategy: "none",
+      labelExpressionInfo: { expression: "Text($feature.cluster_count, '#,###')" },
+      symbol: { type: "text", color: "#ffffff", font: { weight: "bold", size: "11px" } },
+      labelPlacement: "center-center",
+    },
+  ],
+  popupTemplate: { content: "This cluster contains {cluster_count} groups. Zoom in to see them." },
+};
+
+// Density surface for heatmap mode. The dataset is a few dozen national points,
+// so a generous radius and low max density keep regional concentrations visible
+// at the country-wide zoom.
+const HEATMAP_RENDERER = {
+  type: "heatmap",
+  radius: 40,
+  maxDensity: 0.001,
+  minDensity: 0,
+  colorStops: [
+    { ratio: 0, color: "rgba(46, 125, 50, 0)" },
+    { ratio: 0.3, color: "rgba(46, 125, 50, 0.55)" },
+    { ratio: 0.65, color: "rgba(255, 179, 0, 0.8)" },
+    { ratio: 1, color: "rgba(216, 67, 21, 0.95)" },
+  ],
+};
+
+/** How the group points are drawn: clustered, individual, or a density heatmap. */
+type DisplayMode = "clusters" | "points" | "heatmap";
+const DISPLAY_MODES: DisplayMode[] = ["clusters", "points", "heatmap"];
+
+/**
+ * Viewpoint encoded in the URL hash as `#map=<zoom>/<lat>/<lng>` — written by
+ * the "copy link" control, read here so a shared link reopens the same view.
+ */
+function parseMapHash(): { center: [number, number]; zoom: number } | null {
+  const m = window.location.hash.match(/map=(-?[\d.]+)\/(-?[\d.]+)\/(-?[\d.]+)/);
+  if (!m) return null;
+  const zoom = Number(m[1]);
+  const lat = Number(m[2]);
+  const lng = Number(m[3]);
+  // Reject out-of-range values (a doctored link with lat 999 or zoom 99 would
+  // otherwise open onto a blank void) — fall back to the national view instead.
+  if (![zoom, lat, lng].every(Number.isFinite)) return null;
+  if (zoom < 0 || zoom > 23 || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+  return { center: [lng, lat], zoom };
 }
 
 /** Build the popup HTML for a single group feature. */
@@ -216,6 +288,15 @@ export function CatchmentMap({
   const [measureSlot, setMeasureSlot] = useState<HTMLDivElement | null>(null);
   // Map longitude/latitude under the cursor, shown in the coordinate readout.
   const [pointer, setPointer] = useState<{ lng: number; lat: number } | null>(null);
+  // Group (or cluster) under the cursor — drives the hover tooltip.
+  const [hover, setHover] = useState<{ x: number; y: number; label: string } | null>(null);
+  // How the point layer is drawn; the segmented control below switches this.
+  const [displayMode, setDisplayMode] = useState<DisplayMode>("clusters");
+  // Host node for the "copy link" button, slotted into the ESRI widget stack.
+  const [shareSlot, setShareSlot] = useState<HTMLDivElement | null>(null);
+  // Transient "link copied" feedback on the share button.
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   // Build the map + point layer once.
   useEffect(() => {
@@ -237,6 +318,7 @@ export function CatchmentMap({
         Measurement,
         BasemapGallery,
         Home,
+        Compass,
         Locate,
         Fullscreen,
         Legend,
@@ -256,6 +338,7 @@ export function CatchmentMap({
         "esri/widgets/Measurement",
         "esri/widgets/BasemapGallery",
         "esri/widgets/Home",
+        "esri/widgets/Compass",
         "esri/widgets/Locate",
         "esri/widgets/Fullscreen",
         "esri/widgets/Legend",
@@ -273,6 +356,7 @@ export function CatchmentMap({
         EsriGraphicCtor,
         Ctor<unknown>,
         Ctor<EsriMeasurement>,
+        Ctor<unknown>,
         Ctor<unknown>,
         Ctor<unknown>,
         Ctor<unknown>,
@@ -327,31 +411,9 @@ export function CatchmentMap({
           { name: "description", type: "string" },
           { name: "website", type: "string" },
         ],
-        renderer: {
-          type: "unique-value",
-          field: "gtype",
-          uniqueValueInfos: [
-            { value: "catchment", symbol: markerSymbol(TYPE_COLORS.catchment) },
-            { value: "community", symbol: markerSymbol(TYPE_COLORS.community) },
-            { value: "environmental", symbol: markerSymbol(TYPE_COLORS.environmental) },
-          ],
-        },
+        renderer: POINT_RENDERER,
         popupTemplate: { title: "{name}", content: popupContent },
-        featureReduction: {
-          type: "cluster",
-          clusterRadius: "80px",
-          clusterMinSize: "22px",
-          clusterMaxSize: "44px",
-          labelingInfo: [
-            {
-              deconflictionStrategy: "none",
-              labelExpressionInfo: { expression: "Text($feature.cluster_count, '#,###')" },
-              symbol: { type: "text", color: "#ffffff", font: { weight: "bold", size: "11px" } },
-              labelPlacement: "center-center",
-            },
-          ],
-          popupTemplate: { content: "This cluster contains {cluster_count} groups. Zoom in to see them." },
-        },
+        featureReduction: CLUSTER_REDUCTION,
       });
       layerRef.current = layer;
 
@@ -364,10 +426,13 @@ export function CatchmentMap({
         sketchLayer.addMany(storedGraphics.map((g) => Graphic.fromJSON(g)));
       }
       const map = new EsriMap({ basemap: "satellite", layers: [layer, sketchLayer] });
+      // A shared link (`#map=zoom/lat/lng`) reopens at that exact viewpoint;
+      // otherwise start at the national extent.
+      const sharedView = parseMapHash();
       const view = new MapView({
         container: ref.current,
         map,
-        extent: NZ_EXTENT,
+        ...(sharedView ?? { extent: NZ_EXTENT }),
         popup: { dockEnabled: false, collapseEnabled: false },
         constraints: { minZoom: 4 },
       });
@@ -423,6 +488,11 @@ export function CatchmentMap({
       // centre/zoom the map opens at), so users can recover after panning away.
       const home = new Home({ view });
       view.ui.add(home, "top-left");
+
+      // Compass: shows the current heading once the map is rotated (right-click
+      // drag, or two-finger twist on touch); clicking it snaps back to north.
+      const compass = new Compass({ view });
+      view.ui.add(compass, "top-left");
 
       // Locate ("Near me"): geolocates the browser and zooms to the user's
       // position, the quickest way to find catchment groups near you. Uses the
@@ -524,8 +594,16 @@ export function CatchmentMap({
       setMeasureSlot(slot);
       view.ui.add(slot, "top-left");
 
-      // Live coordinate readout: track the pointer and surface the map
-      // longitude/latitude under the cursor in the custom overlay below.
+      // Same pattern for the "copy a link to this view" button.
+      const share = document.createElement("div");
+      setShareSlot(share);
+      view.ui.add(share, "top-left");
+
+      // Live coordinate readout + hover tooltip: track the pointer, surface the
+      // map longitude/latitude under the cursor, and name the group (or size of
+      // the cluster) being hovered. hitTest results also drive the pointer
+      // cursor so points read as clickable.
+      let hitPending = false;
       view.on("pointer-move", (event) => {
         const point = view.toMap(event);
         // `toMap` can return a point with null lng/lat when the cursor is over
@@ -534,8 +612,34 @@ export function CatchmentMap({
         if (point && point.longitude != null && point.latitude != null) {
           setPointer({ lng: point.longitude, lat: point.latitude });
         }
+
+        // At most one hitTest in flight — pointer-move fires far faster than
+        // the test resolves, and a stale tooltip one frame behind is fine.
+        if (hitPending) return;
+        hitPending = true;
+        const { x, y } = event as { x: number; y: number };
+        view
+          .hitTest(event, { include: layer })
+          .then((resp) => {
+            hitPending = false;
+            const attrs = resp.results.find((r) => r.graphic?.attributes)?.graphic?.attributes;
+            const count = Number(attrs?.cluster_count);
+            const label = attrs?.id
+              ? attrs.name
+              : count >= 1
+                ? `${count} ${count === 1 ? "group" : "groups"} — click to zoom in`
+                : null;
+            setHover(label ? { x, y, label } : null);
+            if (ref.current) ref.current.style.cursor = label ? "pointer" : "";
+          })
+          .catch(() => {
+            hitPending = false;
+          });
       });
-      view.on("pointer-leave", () => setPointer(null));
+      view.on("pointer-leave", () => {
+        setPointer(null);
+        setHover(null);
+      });
 
       // Map click → select the underlying group (clusters have no `id`, so they
       // fall through to the default cluster popup).
@@ -558,12 +662,31 @@ export function CatchmentMap({
       layerRef.current = null;
       measurementRef.current = null;
       setMeasureSlot(null);
+      setShareSlot(null);
       setReady(false);
       setActiveTool(null);
       setMenuOpen(false);
       setPointer(null);
+      setHover(null);
+      setCopied(false);
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
     };
   }, [groups]);
+
+  // Apply the chosen display mode: clustered markers (default), every
+  // individual point, or a density heatmap. Clustering and the heatmap are
+  // mutually exclusive, so heatmap mode also turns clustering off.
+  useEffect(() => {
+    const layer = layerRef.current;
+    if (!ready || !layer) return;
+    if (displayMode === "heatmap") {
+      layer.featureReduction = null;
+      layer.renderer = HEATMAP_RENDERER;
+    } else {
+      layer.renderer = POINT_RENDERER;
+      layer.featureReduction = displayMode === "clusters" ? CLUSTER_REDUCTION : null;
+    }
+  }, [ready, displayMode]);
 
   // Apply the active search/filters by hiding non-matching points.
   useEffect(() => {
@@ -688,6 +811,21 @@ export function CatchmentMap({
     setActiveTool(null);
   }
 
+  // Write the current viewpoint into the URL hash and copy the link, so the
+  // exact view can be shared (parseMapHash restores it on load).
+  function copyShareLink() {
+    const view = viewRef.current;
+    const center = view?.center;
+    if (!view || !center || center.latitude == null || center.longitude == null) return;
+    const url = new URL(window.location.href);
+    url.hash = `map=${view.zoom.toFixed(2)}/${center.latitude.toFixed(5)}/${center.longitude.toFixed(5)}`;
+    window.history.replaceState(null, "", url);
+    navigator.clipboard?.writeText(url.toString()).catch(() => undefined);
+    setCopied(true);
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopied(false), 2000);
+  }
+
   if (error) {
     return (
       <div className="flex h-full w-full items-center justify-center p-6 text-center text-sm text-neutral-500">
@@ -756,6 +894,57 @@ export function CatchmentMap({
           measureSlot,
         )}
 
+      {shareSlot &&
+        createPortal(
+          <button
+            type="button"
+            aria-label={copied ? "Link copied to clipboard" : "Copy a link to this map view"}
+            title={copied ? "Link copied!" : "Copy a link to this map view"}
+            onClick={copyShareLink}
+            className={`flex h-8 w-8 items-center justify-center shadow-[0_1px_2px_rgba(0,0,0,0.3)] transition-colors ${
+              copied ? "bg-neutral-900 text-white" : "bg-white text-[#6e6e6e] hover:bg-neutral-100"
+            }`}
+          >
+            {copied ? <CheckIcon /> : <LinkIcon />}
+          </button>,
+          shareSlot,
+        )}
+
+      {ready && (
+        <div
+          role="radiogroup"
+          aria-label="Point display mode"
+          className="absolute left-1/2 top-3 z-10 flex -translate-x-1/2 gap-0.5 rounded-md border border-neutral-200 bg-white/95 p-0.5 text-xs shadow-md backdrop-blur"
+        >
+          {DISPLAY_MODES.map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              role="radio"
+              aria-checked={displayMode === mode}
+              onClick={() => setDisplayMode(mode)}
+              className={`rounded px-2.5 py-1 font-medium capitalize transition-colors ${
+                displayMode === mode
+                  ? "bg-neutral-900 text-white"
+                  : "text-neutral-600 hover:bg-neutral-100"
+              }`}
+            >
+              {mode}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {hover && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute z-10 max-w-[240px] rounded-md bg-neutral-900/90 px-2 py-1 text-xs font-medium text-white shadow-sm"
+          style={{ left: hover.x + 12, top: hover.y + 12 }}
+        >
+          {hover.label}
+        </div>
+      )}
+
       {ready && pointer && (
         <div
           aria-hidden
@@ -789,6 +978,45 @@ function MenuItem({
     >
       {children}
     </button>
+  );
+}
+
+// Chain-link glyph for the share ("copy link") button.
+function LinkIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </svg>
+  );
+}
+
+// Confirmation tick shown briefly after the share link is copied.
+function CheckIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="m5 13 4 4L19 7" />
+    </svg>
   );
 }
 
