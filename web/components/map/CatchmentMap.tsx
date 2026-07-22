@@ -2,9 +2,13 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { ReactNode } from "react";
 import type { CatchmentMapProps } from "./CatchmentMapLazy";
-import { TYPE_COLORS, TYPE_LABELS } from "@/lib/group-types";
+import { SELECTED_MIN_ZOOM, NZ_EXTENT } from "./catchment-map/constants";
+import { DISPLAY_MODES, HEATMAP_RENDERER, POINT_RENDERER, CLUSTER_REDUCTION } from "./catchment-map/renderers";
+import type { DisplayMode } from "./catchment-map/renderers";
+import { popupContent } from "./catchment-map/popup";
+import { useMapView } from "./catchment-map/use-map-view";
+import { CheckIcon, LinkIcon, MenuItem, RulerIcon } from "./catchment-map/icons";
 
 /**
  * ArcGIS Maps SDK renderer (client-side only — ADR-0005), modelled on the
@@ -15,247 +19,9 @@ import { TYPE_COLORS, TYPE_LABELS } from "@/lib/group-types";
  * The SDK is loaded from ESRI's CDN at runtime (AMD loader) rather than bundled.
  * @arcgis/core is ~123MB and makes Turbopack saturate CPU compiling the whole
  * module graph before the route can return any HTML. The CDN loader keeps the
- * SDK out of the bundle entirely.
+ * SDK out of the bundle entirely. See ./catchment-map for the loader, types,
+ * constants and the map/widget setup hook.
  */
-const ARCGIS_VERSION = "4.31";
-const ARCGIS_BASE = `https://js.arcgis.com/${ARCGIS_VERSION}`;
-
-// Full-country view (Aotearoa New Zealand). A geographic extent of the main
-// islands (incl. Stewart Island) rather than a fixed centre/zoom, so the country
-// fills the frame at any aspect ratio instead of floating in a sea of ocean.
-const NZ_EXTENT = {
-  xmin: 166.0,
-  ymin: -47.4,
-  xmax: 178.8,
-  ymax: -34.0,
-  spatialReference: { wkid: 4326 },
-};
-const SELECTED_MIN_ZOOM = 9;
-
-// Esri's World Geocoder. The Search widget may call this anonymously for
-// interactive search (no API key needed); we restrict it to NZ addresses.
-const GEOCODER_URL =
-  "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer";
-
-// Esri's public Export Web Map task, used by the Print widget to render the
-// current map to PDF/image. Anonymous, no API key required.
-const PRINT_SERVICE_URL =
-  "https://utility.arcgisonline.com/arcgis/rest/services/Utilities/PrintingTools/GPServer/Export%20Web%20Map%20Task";
-
-// localStorage keys for session-persisted map annotations and bookmarks.
-const SKETCH_KEY = "catchmentmap:annotations";
-const BOOKMARKS_KEY = "catchmentmap:bookmarks";
-
-/** Read a JSON array from localStorage, tolerating missing/corrupt values. */
-function loadStored(key: string): Record<string, unknown>[] {
-  try {
-    const raw = localStorage.getItem(key);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-/** Persist a JSON-serialisable value, swallowing quota/serialisation errors. */
-function saveStored(key: string, value: unknown): void {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    /* ignore — storage full or unavailable */
-  }
-}
-
-type AmdRequire = (modules: string[], onLoad: (...mods: unknown[]) => void) => void;
-
-declare global {
-  interface Window {
-    require?: AmdRequire;
-  }
-}
-
-let loaderPromise: Promise<AmdRequire> | undefined;
-
-/** Inject the ArcGIS CSS + AMD loader from the CDN once, then resolve `require`. */
-function loadArcgis(): Promise<AmdRequire> {
-  if (typeof window === "undefined") return Promise.reject(new Error("no window"));
-  if (window.require) return Promise.resolve(window.require);
-  if (loaderPromise) return loaderPromise;
-
-  loaderPromise = new Promise<AmdRequire>((resolve, reject) => {
-    if (!document.querySelector("link[data-arcgis]")) {
-      const link = document.createElement("link");
-      link.rel = "stylesheet";
-      link.href = `${ARCGIS_BASE}/esri/themes/light/main.css`;
-      link.dataset.arcgis = "true";
-      document.head.appendChild(link);
-    }
-    const script = document.createElement("script");
-    script.src = `${ARCGIS_BASE}/init.js`;
-    script.async = true;
-    script.onload = () =>
-      window.require ? resolve(window.require) : reject(new Error("ArcGIS loader missing"));
-    script.onerror = () => reject(new Error("Failed to load ArcGIS SDK"));
-    document.head.appendChild(script);
-  });
-  return loaderPromise;
-}
-
-/** Promisified AMD require for the modules we need. */
-function requireModules(req: AmdRequire, modules: string[]): Promise<unknown[]> {
-  return new Promise((resolve) => req(modules, (...mods) => resolve(mods)));
-}
-
-type Ctor<T> = new (o?: unknown) => T;
-type EsriFeature = { geometry: unknown; attributes: Record<string, string> };
-type EsriQuery = { where: string; returnGeometry: boolean; outFields: string[] };
-type EsriLayerView = { queryFeatures: (q: EsriQuery) => Promise<{ features: EsriFeature[] }> };
-type EsriLayer = {
-  definitionExpression: string;
-  createQuery: () => EsriQuery;
-  featureReduction: unknown;
-  renderer: unknown;
-};
-type EsriMapPoint = { longitude: number | null; latitude: number | null };
-type EsriView = {
-  zoom: number;
-  center: EsriMapPoint | null;
-  openPopup: (o: unknown) => Promise<unknown>;
-  destroy: () => void;
-  when: () => Promise<unknown>;
-  goTo: (target: unknown, options?: unknown) => Promise<unknown>;
-  hitTest: (e: unknown, opts?: unknown) => Promise<{ results: { graphic?: EsriFeature }[] }>;
-  whenLayerView: (layer: unknown) => Promise<EsriLayerView>;
-  on: (event: string, handler: (e: unknown) => void) => void;
-  toMap: (screenPoint: unknown) => EsriMapPoint | null;
-  ui: { add: (widget: unknown, position: string) => void };
-};
-// Combined measurement widget — `activeTool` switches between the 2D distance
-// and area tools; `clear()` removes the current measurement graphics.
-type MeasureTool = "distance" | "area";
-type EsriMeasurement = {
-  activeTool: MeasureTool | null;
-  clear: () => void;
-  destroy: () => void;
-};
-
-// JSON-serialisable map artefacts (Graphic / Bookmark both expose `toJSON`).
-type EsriJSONObject = { toJSON: () => Record<string, unknown> };
-type EsriCollection<T> = {
-  toArray: () => T[];
-  on: (event: string, handler: () => void) => void;
-};
-// `Graphic` constructor, plus the static `fromJSON` used to rehydrate drawings.
-type EsriGraphicCtor = Ctor<EsriFeature> & {
-  fromJSON: (json: Record<string, unknown>) => EsriFeature;
-};
-type EsriGraphicsLayer = {
-  graphics: EsriCollection<EsriJSONObject>;
-  addMany: (graphics: unknown[]) => void;
-};
-// Sketch fires create/update/delete; `state === "complete"` marks a finished edit.
-type EsriSketch = {
-  on: (event: string, handler: (e: { state?: string }) => void) => void;
-};
-type EsriBookmarks = { bookmarks: EsriCollection<EsriJSONObject> };
-
-function markerSymbol(color: string) {
-  return {
-    type: "simple-marker",
-    color,
-    size: 9,
-    outline: { color: "#ffffff", width: 1 },
-  };
-}
-
-// One coloured marker per group type — the layer's default renderer, restored
-// when leaving heatmap mode.
-const POINT_RENDERER = {
-  type: "unique-value",
-  field: "gtype",
-  uniqueValueInfos: [
-    { value: "catchment", symbol: markerSymbol(TYPE_COLORS.catchment) },
-    { value: "community", symbol: markerSymbol(TYPE_COLORS.community) },
-    { value: "environmental", symbol: markerSymbol(TYPE_COLORS.environmental) },
-  ],
-};
-
-// Cluster display (the default) — nearby points merge into a counted circle.
-const CLUSTER_REDUCTION = {
-  type: "cluster",
-  clusterRadius: "80px",
-  clusterMinSize: "22px",
-  clusterMaxSize: "44px",
-  labelingInfo: [
-    {
-      deconflictionStrategy: "none",
-      labelExpressionInfo: { expression: "Text($feature.cluster_count, '#,###')" },
-      symbol: { type: "text", color: "#ffffff", font: { weight: "bold", size: "11px" } },
-      labelPlacement: "center-center",
-    },
-  ],
-  popupTemplate: { content: "This cluster contains {cluster_count} groups. Zoom in to see them." },
-};
-
-// Density surface for heatmap mode. The dataset is a few dozen national points,
-// so a generous radius and low max density keep regional concentrations visible
-// at the country-wide zoom.
-const HEATMAP_RENDERER = {
-  type: "heatmap",
-  radius: 40,
-  maxDensity: 0.001,
-  minDensity: 0,
-  colorStops: [
-    { ratio: 0, color: "rgba(46, 125, 50, 0)" },
-    { ratio: 0.3, color: "rgba(46, 125, 50, 0.55)" },
-    { ratio: 0.65, color: "rgba(255, 179, 0, 0.8)" },
-    { ratio: 1, color: "rgba(216, 67, 21, 0.95)" },
-  ],
-};
-
-/** How the group points are drawn: clustered, individual, or a density heatmap. */
-type DisplayMode = "clusters" | "points" | "heatmap";
-const DISPLAY_MODES: DisplayMode[] = ["clusters", "points", "heatmap"];
-
-/**
- * Viewpoint encoded in the URL hash as `#map=<zoom>/<lat>/<lng>` — written by
- * the "copy link" control, read here so a shared link reopens the same view.
- */
-function parseMapHash(): { center: [number, number]; zoom: number } | null {
-  const m = window.location.hash.match(/map=(-?[\d.]+)\/(-?[\d.]+)\/(-?[\d.]+)/);
-  if (!m) return null;
-  const zoom = Number(m[1]);
-  const lat = Number(m[2]);
-  const lng = Number(m[3]);
-  // Reject out-of-range values (a doctored link with lat 999 or zoom 99 would
-  // otherwise open onto a blank void) — fall back to the national view instead.
-  if (![zoom, lat, lng].every(Number.isFinite)) return null;
-  if (zoom < 0 || zoom > 23 || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
-  return { center: [lng, lat], zoom };
-}
-
-/** Build the popup HTML for a single group feature. */
-function popupContent(feature: { graphic: EsriFeature }): string {
-  const a = feature.graphic.attributes;
-  const rows: [string, string][] = [
-    ["Type", TYPE_LABELS[a.gtype as keyof typeof TYPE_LABELS] ?? a.gtype],
-    ["Region", a.region],
-    ["Status", a.status],
-    ["Focus areas", a.focus || "—"],
-  ];
-  const table = rows
-    .map(
-      ([k, v]) =>
-        `<tr><th style="text-align:left;padding:2px 12px 2px 0;color:#525252;font-weight:500;vertical-align:top">${k}</th><td style="padding:2px 0">${v}</td></tr>`,
-    )
-    .join("");
-  const desc = a.description ? `<p style="margin:8px 0 0">${a.description}</p>` : "";
-  const site = a.website
-    ? `<p style="margin:8px 0 0"><a href="${a.website}" target="_blank" rel="noopener">Visit website ↗</a></p>`
-    : "";
-  return `<table style="font-size:13px"><tbody>${table}</tbody></table>${desc}${site}`;
-}
-
 export function CatchmentMap({
   groups,
   visibleIds,
@@ -264,414 +30,31 @@ export function CatchmentMap({
   onSelect,
 }: CatchmentMapProps) {
   const ref = useRef<HTMLDivElement>(null);
-  const viewRef = useRef<EsriView | null>(null);
-  const layerRef = useRef<EsriLayer | null>(null);
-  const onSelectRef = useRef(onSelect);
-  // Keep the ref pointing at the latest callback without re-running map setup.
-  useEffect(() => {
-    onSelectRef.current = onSelect;
-  });
   const prevRegionRef = useRef<string | undefined>(undefined);
-  // id → source graphic, so selecting a group can locate it without an async
-  // layer query (which proved unreliable with client-side source + clustering).
-  const graphicsRef = useRef<Map<string, EsriFeature>>(new Map());
-  const measurementRef = useRef<EsriMeasurement | null>(null);
 
-  const [ready, setReady] = useState(false);
-  const [error, setError] = useState(false);
-  const [activeTool, setActiveTool] = useState<MeasureTool | null>(null);
+  const {
+    viewRef,
+    layerRef,
+    graphicsRef,
+    ready,
+    error,
+    activeTool,
+    toggleTool,
+    clearMeasurements,
+    measureSlot,
+    shareSlot,
+    pointer,
+    hover,
+  } = useMapView(ref, groups, onSelect);
+
   // Whether the measurement options popup (under the ruler button) is open.
   const [menuOpen, setMenuOpen] = useState(false);
   const measureRef = useRef<HTMLDivElement | null>(null);
-  // Host node for the custom measure control, slotted into the ESRI widget stack.
-  // Held in state (not a ref) so the portal renders once the node exists.
-  const [measureSlot, setMeasureSlot] = useState<HTMLDivElement | null>(null);
-  // Map longitude/latitude under the cursor, shown in the coordinate readout.
-  const [pointer, setPointer] = useState<{ lng: number; lat: number } | null>(null);
-  // Group (or cluster) under the cursor — drives the hover tooltip.
-  const [hover, setHover] = useState<{ x: number; y: number; label: string } | null>(null);
   // How the point layer is drawn; the segmented control below switches this.
   const [displayMode, setDisplayMode] = useState<DisplayMode>("clusters");
-  // Host node for the "copy link" button, slotted into the ESRI widget stack.
-  const [shareSlot, setShareSlot] = useState<HTMLDivElement | null>(null);
   // Transient "link copied" feedback on the share button.
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-
-  // Build the map + point layer once.
-  useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      if (!ref.current) return;
-      const req = await loadArcgis().catch(() => undefined);
-      if (!req) {
-        setError(true);
-        return;
-      }
-      const [
-        EsriMap,
-        MapView,
-        FeatureLayer,
-        Graphic,
-        Search,
-        Measurement,
-        BasemapGallery,
-        Home,
-        Compass,
-        Locate,
-        Fullscreen,
-        Legend,
-        Expand,
-        ScaleBar,
-        GraphicsLayer,
-        Sketch,
-        Bookmarks,
-        Bookmark,
-        Print,
-      ] = (await requireModules(req, [
-        "esri/Map",
-        "esri/views/MapView",
-        "esri/layers/FeatureLayer",
-        "esri/Graphic",
-        "esri/widgets/Search",
-        "esri/widgets/Measurement",
-        "esri/widgets/BasemapGallery",
-        "esri/widgets/Home",
-        "esri/widgets/Compass",
-        "esri/widgets/Locate",
-        "esri/widgets/Fullscreen",
-        "esri/widgets/Legend",
-        "esri/widgets/Expand",
-        "esri/widgets/ScaleBar",
-        "esri/layers/GraphicsLayer",
-        "esri/widgets/Sketch",
-        "esri/widgets/Bookmarks",
-        "esri/webmap/Bookmark",
-        "esri/widgets/Print",
-      ])) as [
-        Ctor<unknown>,
-        Ctor<EsriView>,
-        Ctor<EsriLayer>,
-        EsriGraphicCtor,
-        Ctor<unknown>,
-        Ctor<EsriMeasurement>,
-        Ctor<unknown>,
-        Ctor<unknown>,
-        Ctor<unknown>,
-        Ctor<unknown>,
-        Ctor<unknown>,
-        Ctor<unknown>,
-        Ctor<unknown>,
-        Ctor<unknown>,
-        Ctor<EsriGraphicsLayer>,
-        Ctor<EsriSketch>,
-        Ctor<EsriBookmarks>,
-        { fromJSON: (json: Record<string, unknown>) => unknown },
-        Ctor<unknown>,
-      ];
-      if (cancelled || !ref.current) return;
-
-      const graphics = new Map<string, EsriFeature>();
-      const source = groups
-        .filter((g) => g.location)
-        .map((g, i) => {
-          const graphic = new Graphic({
-            geometry: { type: "point", longitude: g.location!.lng, latitude: g.location!.lat },
-            attributes: {
-              oid: i + 1,
-              id: g.id,
-              name: g.name,
-              gtype: g.type,
-              region: g.region,
-              status: g.status,
-              focus: g.focusAreas.join(", "),
-              description: g.description ?? "",
-              website: g.website ?? "",
-            },
-          }) as EsriFeature;
-          graphics.set(g.id, graphic);
-          return graphic;
-        });
-      graphicsRef.current = graphics;
-
-      const layer = new FeatureLayer({
-        source,
-        objectIdField: "oid",
-        geometryType: "point",
-        spatialReference: { wkid: 4326 },
-        fields: [
-          { name: "oid", type: "oid" },
-          { name: "id", type: "string" },
-          { name: "name", type: "string" },
-          { name: "gtype", type: "string" },
-          { name: "region", type: "string" },
-          { name: "status", type: "string" },
-          { name: "focus", type: "string" },
-          { name: "description", type: "string" },
-          { name: "website", type: "string" },
-        ],
-        renderer: POINT_RENDERER,
-        popupTemplate: { title: "{name}", content: popupContent },
-        featureReduction: CLUSTER_REDUCTION,
-      });
-      layerRef.current = layer;
-
-      // Empty layer the Sketch tool draws annotations onto, kept above the
-      // group points so markups stay visible. Any drawings saved in a previous
-      // session are rehydrated from localStorage.
-      const sketchLayer = new GraphicsLayer({ title: "Annotations" });
-      const storedGraphics = loadStored(SKETCH_KEY);
-      if (storedGraphics.length) {
-        sketchLayer.addMany(storedGraphics.map((g) => Graphic.fromJSON(g)));
-      }
-      const map = new EsriMap({ basemap: "satellite", layers: [layer, sketchLayer] });
-      // A shared link (`#map=zoom/lat/lng`) reopens at that exact viewpoint;
-      // otherwise start at the national extent.
-      const sharedView = parseMapHash();
-      const view = new MapView({
-        container: ref.current,
-        map,
-        ...(sharedView ?? { extent: NZ_EXTENT }),
-        popup: { dockEnabled: false, collapseEnabled: false },
-        constraints: { minZoom: 4 },
-      });
-      viewRef.current = view;
-
-      // Address search, constrained to Aotearoa New Zealand. The single locator
-      // source uses Esri's World Geocoder with `countryCode: "NZL"` so only NZ
-      // addresses are suggested and returned; a found address zooms the view to
-      // that location.
-      const search = new Search({
-        view,
-        includeDefaultSources: false,
-        popupEnabled: false,
-        locationEnabled: false,
-        allPlaceholder: "Search a New Zealand address…",
-        sources: [
-          {
-            url: GEOCODER_URL,
-            name: "New Zealand addresses",
-            placeholder: "Search a New Zealand address…",
-            // `countryCode` limits the geocoder to NZ precisely (incl. offshore
-            // areas like the Chatham Islands). We deliberately avoid a bounding
-            // box, which would wrongly exclude valid addresses near the edges.
-            countryCode: "NZL",
-            singleLineFieldName: "SingleLine",
-          },
-        ],
-      });
-      view.ui.add(search, "top-right");
-
-      // Measurement tools (distance + area). The widget renders the running
-      // result panel; the toolbar below the map switches `activeTool`. Drawing
-      // happens by clicking points on the map: two points for a distance line,
-      // three or more for an area polygon (which also reports its perimeter).
-      const measurement = new Measurement({ view, activeTool: null });
-      view.ui.add(measurement, "bottom-right");
-      measurementRef.current = measurement;
-
-      // Basemap picker: choose from Esri's gallery of basemaps (satellite,
-      // topographic, streets, terrain, etc.). The map opens on satellite
-      // imagery; the gallery lets users switch to any other view. Tucked inside
-      // an Expand so it stays a single icon until opened.
-      const basemapGallery = new BasemapGallery({ view });
-      const basemapExpand = new Expand({
-        view,
-        content: basemapGallery,
-        expanded: false,
-        expandTooltip: "Change basemap",
-      });
-      view.ui.add(basemapExpand, "bottom-left");
-
-      // Home: one click returns the view to the national extent (the same
-      // centre/zoom the map opens at), so users can recover after panning away.
-      const home = new Home({ view });
-      view.ui.add(home, "top-left");
-
-      // Compass: shows the current heading once the map is rotated (right-click
-      // drag, or two-finger twist on touch); clicking it snaps back to north.
-      const compass = new Compass({ view });
-      view.ui.add(compass, "top-left");
-
-      // Locate ("Near me"): geolocates the browser and zooms to the user's
-      // position, the quickest way to find catchment groups near you. Uses the
-      // standard Geolocation API — the browser prompts for permission.
-      const locate = new Locate({ view });
-      view.ui.add(locate, "top-left");
-
-      // Fullscreen: expand the map element to fill the screen for an immersive
-      // view, then restore. Targets the map container's wrapper.
-      const fullscreen = new Fullscreen({ view });
-      view.ui.add(fullscreen, "top-left");
-
-      // Legend, tucked inside an Expand so it stays out of the way until needed.
-      // It reads the layer renderer, so the group-type colours stay in sync with
-      // the map automatically.
-      const legend = new Legend({ view });
-      const legendExpand = new Expand({
-        view,
-        content: legend,
-        expanded: false,
-        expandTooltip: "Legend",
-        // Shared `group` makes the top-left expandables mutually exclusive:
-        // opening one collapses whichever was previously open.
-        group: "top-left",
-      });
-      view.ui.add(legendExpand, "top-left");
-
-      // Scale bar (metric + imperial) for distance context at the current zoom.
-      const scaleBar = new ScaleBar({ view, unit: "dual" });
-      view.ui.add(scaleBar, "bottom-left");
-
-      // Sketch: draw points, lines, polygons and rectangles onto the annotation
-      // layer to mark up the map (e.g. an area of interest). Includes select,
-      // reshape and delete; tucked inside an Expand to keep the toolbar compact.
-      const sketch = new Sketch({
-        view,
-        layer: sketchLayer,
-        creationMode: "update",
-        visibleElements: { settingsMenu: false },
-      });
-      const sketchExpand = new Expand({
-        view,
-        content: sketch,
-        expanded: false,
-        expandTooltip: "Draw on the map",
-        group: "top-left",
-      });
-      view.ui.add(sketchExpand, "top-left");
-
-      // Persist drawings to localStorage whenever an edit completes (a shape is
-      // finished, moved/reshaped, or deleted) so they survive a page reload.
-      const persistSketch = () =>
-        saveStored(SKETCH_KEY, sketchLayer.graphics.toArray().map((g) => g.toJSON()));
-      sketch.on("create", (e) => {
-        if (e.state === "complete") persistSketch();
-      });
-      sketch.on("update", (e) => {
-        if (e.state === "complete") persistSketch();
-      });
-      sketch.on("delete", persistSketch);
-
-      // Bookmarks: save the current viewpoint and jump back to it later. Editing
-      // is enabled so users can capture their own spots; saved entries are loaded
-      // from localStorage and re-persisted whenever the collection changes.
-      const bookmarks = new Bookmarks({
-        view,
-        dragEnabled: true,
-        visibleElements: { addBookmarkButton: true, editBookmarkButton: true },
-        bookmarks: loadStored(BOOKMARKS_KEY).map((b) => Bookmark.fromJSON(b)),
-      });
-      bookmarks.bookmarks.on("change", () =>
-        saveStored(BOOKMARKS_KEY, bookmarks.bookmarks.toArray().map((b) => b.toJSON())),
-      );
-      const bookmarksExpand = new Expand({
-        view,
-        content: bookmarks,
-        expanded: false,
-        expandTooltip: "Bookmarks",
-        group: "top-left",
-      });
-      view.ui.add(bookmarksExpand, "top-left");
-
-      // Print / export: render the current map (extent, layers, annotations) to a
-      // downloadable PDF or image via Esri's anonymous Export Web Map service.
-      const print = new Print({ view, printServiceUrl: PRINT_SERVICE_URL });
-      const printExpand = new Expand({
-        view,
-        content: print,
-        expanded: false,
-        expandTooltip: "Print / export map",
-        group: "top-left",
-      });
-      view.ui.add(printExpand, "top-left");
-
-      // Slot the custom measurement control into the same top-left widget stack
-      // so the ruler sits with the other tool icons. The button + popup are
-      // rendered into this node via a React portal (see render below).
-      const slot = document.createElement("div");
-      setMeasureSlot(slot);
-      view.ui.add(slot, "top-left");
-
-      // Same pattern for the "copy a link to this view" button.
-      const share = document.createElement("div");
-      setShareSlot(share);
-      view.ui.add(share, "top-left");
-
-      // Live coordinate readout + hover tooltip: track the pointer, surface the
-      // map longitude/latitude under the cursor, and name the group (or size of
-      // the cluster) being hovered. hitTest results also drive the pointer
-      // cursor so points read as clickable.
-      let hitPending = false;
-      view.on("pointer-move", (event) => {
-        const point = view.toMap(event);
-        // `toMap` can return a point with null lng/lat when the cursor is over
-        // an area outside the projected map; skip those so the readout (which
-        // calls `toFixed`) never sees a null coordinate.
-        if (point && point.longitude != null && point.latitude != null) {
-          setPointer({ lng: point.longitude, lat: point.latitude });
-        }
-
-        // At most one hitTest in flight — pointer-move fires far faster than
-        // the test resolves, and a stale tooltip one frame behind is fine.
-        if (hitPending) return;
-        hitPending = true;
-        const { x, y } = event as { x: number; y: number };
-        view
-          .hitTest(event, { include: layer })
-          .then((resp) => {
-            hitPending = false;
-            const attrs = resp.results.find((r) => r.graphic?.attributes)?.graphic?.attributes;
-            const count = Number(attrs?.cluster_count);
-            const label = attrs?.id
-              ? attrs.name
-              : count >= 1
-                ? `${count} ${count === 1 ? "group" : "groups"} — click to zoom in`
-                : null;
-            setHover(label ? { x, y, label } : null);
-            if (ref.current) ref.current.style.cursor = label ? "pointer" : "";
-          })
-          .catch(() => {
-            hitPending = false;
-          });
-      });
-      view.on("pointer-leave", () => {
-        setPointer(null);
-        setHover(null);
-      });
-
-      // Map click → select the underlying group (clusters have no `id`, so they
-      // fall through to the default cluster popup).
-      view.on("click", (event) => {
-        view.hitTest(event, { include: layer }).then((resp) => {
-          const graphic = resp.results.find((r) => r.graphic?.attributes?.id)?.graphic;
-          if (graphic) onSelectRef.current(graphic.attributes.id);
-        });
-      });
-
-      await view.when().catch(() => undefined);
-      if (cancelled) return;
-      setReady(true);
-    })();
-
-    return () => {
-      cancelled = true;
-      viewRef.current?.destroy();
-      viewRef.current = null;
-      layerRef.current = null;
-      measurementRef.current = null;
-      setMeasureSlot(null);
-      setShareSlot(null);
-      setReady(false);
-      setActiveTool(null);
-      setMenuOpen(false);
-      setPointer(null);
-      setHover(null);
-      setCopied(false);
-      if (copiedTimer.current) clearTimeout(copiedTimer.current);
-    };
-  }, [groups]);
 
   // Apply the chosen display mode: clustered markers (default), every
   // individual point, or a density heatmap. Clustering and the heatmap are
@@ -686,7 +69,7 @@ export function CatchmentMap({
       layer.renderer = POINT_RENDERER;
       layer.featureReduction = displayMode === "clusters" ? CLUSTER_REDUCTION : null;
     }
-  }, [ready, displayMode]);
+  }, [ready, displayMode, layerRef]);
 
   // Apply the active search/filters by hiding non-matching points.
   useEffect(() => {
@@ -695,7 +78,7 @@ export function CatchmentMap({
     layer.definitionExpression = visibleIds.length
       ? `id IN (${visibleIds.map((id) => `'${id}'`).join(",")})`
       : "1=0";
-  }, [ready, visibleIds]);
+  }, [ready, visibleIds, layerRef]);
 
   // When a region is chosen, zoom the map in and centre it on that region; when
   // the region filter is cleared (after having been set), zoom back out to the
@@ -734,7 +117,7 @@ export function CatchmentMap({
     const zoom = Math.max(6, Math.min(12, Math.round(Math.log2(360 / span)) - 1));
 
     view.goTo({ center, zoom }, { duration: 800 }).catch(() => undefined);
-  }, [ready, regionFilter, groups]);
+  }, [ready, regionFilter, groups, viewRef]);
 
   // Zoom to and open the popup for the selected group.
   useEffect(() => {
@@ -766,7 +149,7 @@ export function CatchmentMap({
     return () => {
       cancelled = true;
     };
-  }, [ready, selectedId, groups]);
+  }, [ready, selectedId, groups, viewRef, graphicsRef]);
 
   // Close the options popup on outside click or Escape.
   useEffect(() => {
@@ -786,30 +169,6 @@ export function CatchmentMap({
       document.removeEventListener("keydown", onKeyDown);
     };
   }, [menuOpen]);
-
-  // Activate a measurement tool, or toggle it off (clearing any drawing) when
-  // the same tool is tapped again.
-  function toggleTool(tool: MeasureTool) {
-    const m = measurementRef.current;
-    if (!m) return;
-    setActiveTool((current) => {
-      if (current === tool) {
-        m.clear();
-        m.activeTool = null;
-        return null;
-      }
-      m.activeTool = tool;
-      return tool;
-    });
-  }
-
-  function clearMeasurements() {
-    const m = measurementRef.current;
-    if (!m) return;
-    m.clear();
-    m.activeTool = null;
-    setActiveTool(null);
-  }
 
   // Write the current viewpoint into the URL hash and copy the link, so the
   // exact view can be shared (parseMapHash restores it on load).
@@ -954,88 +313,5 @@ export function CatchmentMap({
         </div>
       )}
     </div>
-  );
-}
-
-function MenuItem({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      role="menuitemradio"
-      aria-checked={active}
-      onClick={onClick}
-      className={`whitespace-nowrap rounded px-2.5 py-1.5 text-left font-medium transition-colors ${
-        active ? "bg-neutral-900 text-white" : "text-neutral-700 hover:bg-neutral-100"
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
-
-// Chain-link glyph for the share ("copy link") button.
-function LinkIcon() {
-  return (
-    <svg
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-    </svg>
-  );
-}
-
-// Confirmation tick shown briefly after the share link is copied.
-function CheckIcon() {
-  return (
-    <svg
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="m5 13 4 4L19 7" />
-    </svg>
-  );
-}
-
-// Simple ruler glyph for the measurement tools trigger.
-function RulerIcon() {
-  return (
-    <svg
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M3.6 8.5 8.5 3.6a1.5 1.5 0 0 1 2.1 0l9.8 9.8a1.5 1.5 0 0 1 0 2.1l-4.9 4.9a1.5 1.5 0 0 1-2.1 0L3.6 10.6a1.5 1.5 0 0 1 0-2.1Z" />
-      <path d="m8 6 2 2M11 9l1.5 1.5M14 6l2 2M9 11l1.5 1.5" />
-    </svg>
   );
 }

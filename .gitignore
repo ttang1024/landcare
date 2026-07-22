@@ -17,6 +17,8 @@
 /web/test-results/
 *.tsbuildinfo
 
+tech
+
 # Vercel
 .vercel/
 
