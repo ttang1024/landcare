@@ -3,10 +3,12 @@ import type { ReactNode } from "react";
 export function MenuItem({
   active,
   onClick,
+  title,
   children,
 }: {
   active: boolean;
   onClick: () => void;
+  title?: string;
   children: ReactNode;
 }) {
   return (
@@ -15,6 +17,7 @@ export function MenuItem({
       role="menuitemradio"
       aria-checked={active}
       onClick={onClick}
+      title={title}
       className={`whitespace-nowrap rounded px-2.5 py-1.5 text-left font-medium transition-colors ${
         active ? "bg-neutral-900 text-white" : "text-neutral-700 hover:bg-neutral-100"
       }`}

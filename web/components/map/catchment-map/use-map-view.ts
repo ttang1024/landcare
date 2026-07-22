@@ -18,6 +18,7 @@ import { loadStored, saveStored } from "./storage";
 import type {
   Ctor,
   EsriBookmarks,
+  EsriExpand,
   EsriFeature,
   EsriGraphicCtor,
   EsriGraphicsLayer,
@@ -38,18 +39,25 @@ export function useMapView(
   ref: RefObject<HTMLDivElement | null>,
   groups: Group[],
   onSelect: (id: string) => void,
+  onExpandOpen: () => void,
 ) {
   const viewRef = useRef<EsriView | null>(null);
   const layerRef = useRef<EsriLayer | null>(null);
   const onSelectRef = useRef(onSelect);
-  // Keep the ref pointing at the latest callback without re-running map setup.
+  const onExpandOpenRef = useRef(onExpandOpen);
+  // Keep the refs pointing at the latest callbacks without re-running map setup.
   useEffect(() => {
     onSelectRef.current = onSelect;
+    onExpandOpenRef.current = onExpandOpen;
   });
   // id → source graphic, so selecting a group can locate it without an async
   // layer query (which proved unreliable with client-side source + clustering).
   const graphicsRef = useRef<Map<string, EsriFeature>>(new Map());
   const measurementRef = useRef<EsriMeasurement | null>(null);
+  // The top-left Expand widgets (legend/sketch/bookmarks/print) collapse each
+  // other via their shared `group`; kept here so the custom measure popup,
+  // which lives outside that widget group, can join the same exclusivity.
+  const expandWidgetsRef = useRef<EsriExpand[]>([]);
 
   const [ready, setReady] = useState(false);
   const [error, setError] = useState(false);
@@ -128,7 +136,7 @@ export function useMapView(
         Ctor<unknown>,
         Ctor<unknown>,
         Ctor<unknown>,
-        Ctor<unknown>,
+        Ctor<EsriExpand>,
         Ctor<unknown>,
         Ctor<EsriGraphicsLayer>,
         Ctor<EsriSketch>,
@@ -365,6 +373,17 @@ export function useMapView(
       });
       view.ui.add(printExpand, "top-left");
 
+      // Watch the group so the custom measure popup (outside the Expand
+      // widgets' own `group` mechanism) can join the same exclusivity: notify
+      // CatchmentMap to close its popup whenever one of these opens.
+      const expandWidgets = [legendExpand, sketchExpand, bookmarksExpand, printExpand];
+      expandWidgetsRef.current = expandWidgets;
+      expandWidgets.forEach((widget) => {
+        widget.watch("expanded", (expanded) => {
+          if (expanded) onExpandOpenRef.current();
+        });
+      });
+
       // Slot the custom measurement control into the same top-left widget stack
       // so the ruler sits with the other tool icons. The button + popup are
       // rendered into this node via a React portal (see CatchmentMap's render).
@@ -473,6 +492,14 @@ export function useMapView(
     setActiveTool(null);
   }
 
+  // Collapse the top-left Expand widgets (legend/sketch/bookmarks/print), so
+  // opening the custom measure popup hides whichever of them was open.
+  function collapseExpandGroup() {
+    expandWidgetsRef.current.forEach((widget) => {
+      widget.expanded = false;
+    });
+  }
+
   return {
     viewRef,
     layerRef,
@@ -486,5 +513,6 @@ export function useMapView(
     shareSlot,
     pointer,
     hover,
+    collapseExpandGroup,
   };
 }

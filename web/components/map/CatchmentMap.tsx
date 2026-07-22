@@ -32,6 +32,12 @@ export function CatchmentMap({
   const ref = useRef<HTMLDivElement>(null);
   const prevRegionRef = useRef<string | undefined>(undefined);
 
+  // Whether the measurement options popup (under the ruler button) is open.
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  // The ESRI Expand widgets (legend/sketch/bookmarks/print) already collapse
+  // each other via a shared `group`; the custom measure popup lives outside
+  // that group, so close it by hand whenever one of them opens.
   const {
     viewRef,
     layerRef,
@@ -45,10 +51,8 @@ export function CatchmentMap({
     shareSlot,
     pointer,
     hover,
-  } = useMapView(ref, groups, onSelect);
-
-  // Whether the measurement options popup (under the ruler button) is open.
-  const [menuOpen, setMenuOpen] = useState(false);
+    collapseExpandGroup,
+  } = useMapView(ref, groups, onSelect, () => setMenuOpen(false));
   const measureRef = useRef<HTMLDivElement | null>(null);
   // How the point layer is drawn; the segmented control below switches this.
   const [displayMode, setDisplayMode] = useState<DisplayMode>("clusters");
@@ -211,7 +215,14 @@ export function CatchmentMap({
               aria-haspopup="menu"
               aria-expanded={menuOpen}
               aria-pressed={activeTool !== null}
-              onClick={() => setMenuOpen((open) => !open)}
+              onClick={() =>
+                setMenuOpen((open) => {
+                  const next = !open;
+                  if (next) collapseExpandGroup();
+                  return next;
+                })
+              }
+              title="Measurement tools"
               // Match the 32px square ESRI widget buttons it sits beside.
               className={`flex h-8 w-8 items-center justify-center shadow-[0_1px_2px_rgba(0,0,0,0.3)] transition-colors ${
                 activeTool !== null
@@ -232,10 +243,15 @@ export function CatchmentMap({
                 <MenuItem
                   active={activeTool === "distance"}
                   onClick={() => toggleTool("distance")}
+                  title="Measure the distance between points"
                 >
                   Measure distance
                 </MenuItem>
-                <MenuItem active={activeTool === "area"} onClick={() => toggleTool("area")}>
+                <MenuItem
+                  active={activeTool === "area"}
+                  onClick={() => toggleTool("area")}
+                  title="Measure the area of a shape"
+                >
                   Measure area
                 </MenuItem>
                 <button
@@ -243,6 +259,7 @@ export function CatchmentMap({
                   role="menuitem"
                   onClick={clearMeasurements}
                   disabled={!activeTool}
+                  title="Clear measurements"
                   className="rounded px-2.5 py-1.5 text-left font-medium text-neutral-600 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   Clear

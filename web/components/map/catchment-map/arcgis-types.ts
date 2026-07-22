@@ -62,3 +62,6 @@ export type EsriSketch = {
   on: (event: string, handler: (e: { state?: string }) => void) => void;
 };
 export type EsriBookmarks = { bookmarks: EsriCollection<EsriJSONObject> };
+// Expand widgets sharing a `group` collapse each other automatically; watching
+// `expanded` lets the custom measure popup join that exclusivity too.
+export type EsriExpand = { expanded: boolean; watch: (prop: string, cb: (value: boolean) => void) => void };
