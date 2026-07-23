@@ -219,7 +219,7 @@ export function useMapView(
         container: ref.current,
         map,
         ...(sharedView ?? { extent: NZ_EXTENT }),
-        popup: { dockEnabled: false, collapseEnabled: false },
+        popup: { dockEnabled: false, visibleElements: { collapseButton: false } },
         constraints: { minZoom: 4 },
       });
       viewRef.current = view;
